@@ -1,0 +1,11 @@
+notebook_api/__pycache__
+vectorizer/__pycache__
+.venv/
+.ipynb_checkpoints
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+venv/
+source-md/

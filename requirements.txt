@@ -1,0 +1,7 @@
+faiss-cpu
+sentence-transformers
+agent-framework>=1.0.0rc5
+python-dotenv
+boto3
+fastapi
+uvicorn[standard]
