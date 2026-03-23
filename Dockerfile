@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.14-slim
 
 WORKDIR /app
 
@@ -11,6 +11,8 @@ COPY notebook_api/ notebook_api/
 COPY vector-db/ vector-db/
 COPY main_api.py .
 
-EXPOSE 8000
+ENV PORT=8000
+
+EXPOSE ${PORT}
 
 CMD ["python", "main_api.py"]
