@@ -12,14 +12,16 @@
    - 4.1 [vectorizer](#41-vectorizer)
    - 4.2 [notebook_lm](#42-notebook_lm)
    - 4.3 [notebook_api](#43-notebook_api)
-   - 4.4 [Entry Points](#44-entry-points)
+   - 4.4 [notebook_ui](#44-notebook_ui)
+   - 4.5 [Entry Points](#45-entry-points)
 5. [Environment Variables](#5-environment-variables)
 6. [LLM Providers](#6-llm-providers)
 7. [API Reference](#7-api-reference)
 8. [Running the Application](#8-running-the-application)
    - 8.1 [Local (CLI)](#81-local-cli)
    - 8.2 [Local (REST API)](#82-local-rest-api)
-   - 8.3 [Docker](#83-docker)
+   - 8.3 [Local (Gradio UI)](#83-local-gradio-ui)
+   - 8.4 [Docker](#84-docker)
 9. [Dependencies](#9-dependencies)
 10. [Configuration Files](#10-configuration-files)
 11. [Vector Database](#11-vector-database)
@@ -43,6 +45,7 @@ The application ships two interfaces:
 |---|---|---|
 | Interactive CLI | `main.py` | Run from terminal; interactive prompt loop |
 | REST API | `main_api.py` + `notebook_api/` | HTTP server; integrates with other tools or front-ends |
+| Gradio Web UI | `main_ui.py` + `notebook_ui/` | Browser-based chat interface with theme switching and PDF export |
 
 ---
 
@@ -52,6 +55,7 @@ The application ships two interfaces:
 md-notebook/
 ├── main.py                  # CLI entry point
 ├── main_api.py              # REST API entry point
+├── main_ui.py               # Gradio web UI entry point
 ├── requirements.txt         # Python dependencies
 ├── Dockerfile               # Container image definition
 ├── .env                     # Local environment variables (not committed)
@@ -67,10 +71,17 @@ md-notebook/
 │   ├── __init__.py          # Re-exports app
 │   └── app.py               # FastAPI routes, request/response models, lifespan
 │
+├── notebook_ui/             # Gradio web UI package
+│   ├── __init__.py          # Public surface: create_ui()
+│   └── ui.py                # Gradio Blocks layout, theme CSS/JS, PDF export
+│
 ├── vectorizer/              # Embedding + retrieval package
 │   ├── __init__.py          # Public surface: run(), search()
 │   ├── vectorize.py         # Reads source-md/, builds FAISS index + metadata
 │   └── retriever.py         # Loads index on demand, runs similarity search
+│
+├── wireframes/              # UI wireframe (browser preview)
+│   └── wireframe.html       # Standalone HTML wireframe with all three themes
 │
 ├── source-md/               # User's Markdown notes (not committed)
 │   └── *.md
@@ -93,48 +104,51 @@ md-notebook/
  ┌──────────────────────────────────────────────────────────────────┐
  │                        User interfaces                           │
  │                                                                  │
- │   CLI (main.py)              REST API (main_api.py)             │
- │   stdin/stdout loop          FastAPI  POST /ask                 │
- └──────────────────┬───────────────────────┬──────────────────────┘
-                    │                       │
-                    └──────────┬────────────┘
-                               │  notebook_lm.ask(query)
-                               ▼
-              ┌────────────────────────────────┐
-              │        notebook_lm / agent.py  │
-              │   Agent (agent_framework)      │
-              │   System prompt: no-hallucinate│
-              │   Tool: search_notes()         │
-              └───────────────┬────────────────┘
-                              │ search_notes(query)
-                              ▼
-              ┌────────────────────────────────┐
-              │   vectorizer / retriever.py    │
-              │   FAISS IndexFlatL2 (L2 dist)  │
-              │   SentenceTransformer encode   │
-              └───────────────┬────────────────┘
-                              │ top-5 results [{filename, content, score}]
-                              ▼
-              ┌────────────────────────────────┐
-              │       vector-db/               │
-              │   index.faiss + metadata.json  │
-              └────────────────────────────────┘
+ │  Gradio Web UI (main_ui.py)                                      │
+ │  browser  →  notebook_ui/ui.py  →  notebook_lm.ask()  (direct)  │
+ │                                                                  │
+ │  CLI (main.py)              REST API (main_api.py)              │
+ │  stdin/stdout loop          FastAPI  POST /ask                  │
+ └────────────┬─────────────────────────────┬──────────────────────┘
+              │                             │
+              └──────────────┬──────────────┘
+                             │  notebook_lm.ask(query)
+                             ▼
+            ┌────────────────────────────────┐
+            │        notebook_lm / agent.py  │
+            │   Agent (agent_framework)      │
+            │   System prompt: no-hallucinate│
+            │   Tool: search_notes()         │
+            └───────────────┬────────────────┘
+                            │ search_notes(query)
+                            ▼
+            ┌────────────────────────────────┐
+            │   vectorizer / retriever.py    │
+            │   FAISS IndexFlatL2 (L2 dist)  │
+            │   SentenceTransformer encode   │
+            └───────────────┬────────────────┘
+                            │ top-5 results [{filename, content, score}]
+                            ▼
+            ┌────────────────────────────────┐
+            │       vector-db/               │
+            │   index.faiss + metadata.json  │
+            └────────────────────────────────┘
 
  Indexing (once, at startup if vector-db is empty):
-              ┌────────────────────────────────┐
-              │   vectorizer / vectorize.py    │
-              │   source-md/*.md               │
-              │   → SentenceTransformer embed  │
-              │   → FAISS index build          │
-              │   → write index.faiss          │
-              │   → write metadata.json        │
-              └────────────────────────────────┘
+            ┌────────────────────────────────┐
+            │   vectorizer / vectorize.py    │
+            │   source-md/*.md               │
+            │   → SentenceTransformer embed  │
+            │   → FAISS index build          │
+            │   → write index.faiss          │
+            │   → write metadata.json        │
+            └────────────────────────────────┘
 
  LLM back-end (configured via LLM_PROVIDER env var):
-              ┌──────────────────┐   ┌──────────────────────────┐
-              │  Anthropic API   │   │  AWS Bedrock API         │
-              │  (default)       │   │  (LLM_PROVIDER=bedrock)  │
-              └──────────────────┘   └──────────────────────────┘
+            ┌──────────────────┐   ┌──────────────────────────┐
+            │  Anthropic API   │   │  AWS Bedrock API         │
+            │  (default)       │   │  (LLM_PROVIDER=bedrock)  │
+            └──────────────────┘   └──────────────────────────┘
 ```
 
 ### 3.2 Data Flow — Indexing
@@ -261,7 +275,65 @@ class AskResponse(BaseModel):
 
 ---
 
-### 4.4 Entry Points
+### 4.4 `notebook_ui`
+
+| File | Responsibility |
+|---|---|
+| `ui.py` | Gradio Blocks layout, custom CSS/JS, chat handler, PDF export |
+| `__init__.py` | Exports `create_ui()` |
+
+**`create_ui() → gr.Blocks`**  
+Builds the full Gradio application and returns it. Called by `main_ui.py`.
+
+**Layout:**
+
+| Component | Purpose |
+|---|---|
+| `gr.HTML` header | App title and subtitle |
+| `gr.Radio(["Gradient","Dark","Light"])` | Theme switcher — pure JS, no Python round-trip |
+| `gr.Chatbot(type="messages")` | Message history (Gradio 5 format) |
+| `gr.Textbox` + `gr.Button("Send")` | Query input and submit |
+| `gr.Button("Clear Chat")` | Resets chat history and input box |
+| `gr.Button("Export Chat as PDF")` | Triggers PDF generation |
+| `gr.File(visible=False)` | Hidden; becomes a download link once the PDF is generated |
+
+**Themes:**
+
+| Theme | Background | Text |
+|---|---|---|
+| Gradient (default) | `linear-gradient(135deg, #0f2027, #203a43, #2c5364)` | White |
+| Dark | `#000000` | White |
+| Light | `#ffffff` | Black |
+
+Switching is driven by a JS attribute (`data-theme`) on `<body>`. The switch is instant with no server round-trip. The default theme is applied via `INIT_JS` which runs once on page load.
+
+**`_chat(message, history)` (async generator)**  
+1. Appends the user's message to history and yields the updated history immediately.
+2. Inserts an `"Agent is thinking\u2026"` placeholder and yields again.
+3. Calls `await notebook_lm.ask(message)` directly (no HTTP).
+4. Replaces the placeholder with the final answer and yields the completed history.
+
+**`_export_pdf(history)`**  
+Uses `fpdf2.FPDF` to produce an A4, plain-white, black-text PDF:  
+- Header: app title + export timestamp.  
+- Each turn labelled `You:` or `Agent:` with wrapped body text.  
+Returns the path of a temp file; Gradio serves it as a browser download named `chat.pdf`.
+
+---
+
+### 4.5 Entry Points
+
+#### `main_ui.py` — Gradio web UI
+
+```
+python main_ui.py
+```
+
+- Calls `dotenv.load_dotenv()`.
+- Calls `asyncio.run(notebook_lm.startup())` — vectorises if needed; safe before Gradio's event loop starts.
+- Reads `UI_HOST` (default: `0.0.0.0`) and `UI_PORT` (default: `7860`) from environment.
+- Calls `create_ui().launch(server_name=host, server_port=port, inbrowser=True)`.
+- `inbrowser=True` opens the default browser automatically on startup.
 
 #### `main.py` — CLI
 
@@ -304,6 +376,8 @@ Copy `.env.example` to `.env` and fill in your credentials.
 | `AWS_SECRET_ACCESS_KEY` | If `LLM_PROVIDER=bedrock` | — | AWS secret key |
 | `AWS_SESSION_TOKEN` | No | — | AWS session token (temporary credentials only) |
 | `PORT` | No | `8000` | Port the REST API server listens on |
+| `UI_HOST` | No | `0.0.0.0` | Host the Gradio UI binds to (`127.0.0.1` for localhost only) |
+| `UI_PORT` | No | `7860` | Port the Gradio UI listens on |
 
 ---
 
@@ -410,7 +484,26 @@ PORT=9000
 PORT=9000 python main_api.py
 ```
 
-### 8.3 Docker
+### 8.3 Local (Gradio UI)
+
+```bash
+# (after completing steps 1–4 from 8.1 above)
+python main_ui.py
+# Gradio starts on http://0.0.0.0:7860
+# Browser opens automatically
+```
+
+To use a different host or port:
+
+```bash
+# In .env:
+UI_HOST=127.0.0.1
+UI_PORT=8080
+```
+
+The UI calls `notebook_lm.ask()` directly in-process — no REST API server is required when using the Gradio UI.
+
+### 8.4 Docker
 
 The [Dockerfile](../Dockerfile) builds a self-contained image. `source-md/` and `.env` are excluded from the image (via `.dockerignore`); mount them at runtime.
 
@@ -418,20 +511,19 @@ The [Dockerfile](../Dockerfile) builds a self-contained image. `source-md/` and 
 # Build
 docker build -t md-notebook .
 
-# Run — mount notes and env file; override port if desired
+# Run REST API (default)
 docker run -p 8000:8000 \
   -v "$(pwd)/source-md:/app/source-md" \
   -v "$(pwd)/vector-db:/app/vector-db" \
   --env-file .env \
   md-notebook
 
-# Override port
-docker run -p 9000:9000 \
-  -e PORT=9000 \
+# Run Gradio UI instead
+docker run -p 7860:7860 \
   -v "$(pwd)/source-md:/app/source-md" \
   -v "$(pwd)/vector-db:/app/vector-db" \
   --env-file .env \
-  md-notebook
+  md-notebook python main_ui.py
 ```
 
 > **Note:** Mount `vector-db/` as a volume so the FAISS index persists between container restarts and is not re-built on every run.
@@ -440,12 +532,14 @@ docker run -p 9000:9000 \
 
 | Instruction | Value / Purpose |
 |---|---|
-| `FROM` | `python:3.14-slim` |
+| `FROM` | `python:3.12-slim` |
 | `WORKDIR` | `/app` |
-| `COPY` | `requirements.txt`, `vectorizer/`, `notebook_lm/`, `notebook_api/`, `vector-db/`, `main_api.py` |
-| `ENV PORT` | `8000` (default; overridable at `docker run`) |
-| `EXPOSE` | `${PORT}` |
-| `CMD` | `python main_api.py` |
+| `COPY` | `requirements.txt`, `vectorizer/`, `notebook_lm/`, `notebook_api/`, `notebook_ui/`, `vector-db/`, `main_api.py`, `main_ui.py` |
+| `ENV PORT` | `8000` (REST API; overridable at `docker run`) |
+| `ENV UI_HOST` | `0.0.0.0` |
+| `ENV UI_PORT` | `7860` (Gradio UI; overridable at `docker run`) |
+| `EXPOSE` | `${PORT}` and `${UI_PORT}` |
+| `CMD` | `python main_api.py` (override with `python main_ui.py` to run the Gradio UI) |
 
 `source-md/` is **not** copied into the image (it is in `.dockerignore`). You must bind-mount `source-md/` and `vector-db/` as shown above.
 
@@ -462,6 +556,8 @@ docker run -p 9000:9000 \
 | `boto3` | AWS SDK; used by `BedrockChatClient` when `LLM_PROVIDER=bedrock` |
 | `fastapi` | ASGI web framework for the REST API |
 | `uvicorn[standard]` | ASGI server that serves the FastAPI app |
+| `gradio >= 5.0.0` | Browser-based UI framework; powers the chat interface in `notebook_ui/` |
+| `fpdf2 >= 2.7.0` | Pure-Python PDF generation; used by the Export Chat as PDF feature |
 
 ---
 

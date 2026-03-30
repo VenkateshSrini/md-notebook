@@ -5,3 +5,5 @@ python-dotenv
 boto3
 fastapi
 uvicorn[standard]
+gradio>=5.0.0
+fpdf2>=2.7.0
