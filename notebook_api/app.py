@@ -22,13 +22,16 @@ async def root():
 
 class AskRequest(BaseModel):
     query: str
+    thread_id: str | None = None
 
 
 class AskResponse(BaseModel):
     answer: str
+    thread_id: str
+    summary: str
 
 
 @app.post("/ask", response_model=AskResponse)
 async def ask(request: AskRequest):
-    answer = await notebook_lm.ask(request.query)
-    return AskResponse(answer=answer)
+    result = await notebook_lm.ask(request.query, thread_id=request.thread_id)
+    return AskResponse(answer=result.answer, thread_id=result.thread_id, summary=result.summary)

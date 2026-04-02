@@ -11,8 +11,10 @@ async def main():
     await notebook_lm.startup()
 
     print("\nNotebookLM ready. Ask questions about your notes.")
-    print("Tip: Start with 'brief:' for a short answer, or just ask for detailed responses.")
-    print("Type 'quit' to exit.\n")
+    print("Tip: prefix with 'brief:' for a concise answer.")
+    print("Type 'new' to start a fresh conversation. Type 'quit' to exit.\n")
+
+    thread_id: str | None = None
 
     while True:
         try:
@@ -28,8 +30,21 @@ async def main():
             print("Goodbye!")
             break
 
-        response = await notebook_lm.ask(query)
-        print(f"\nAgent: {response}\n")
+        if query.lower() == "new":
+            thread_id = None
+            print("\n[New conversation started]\n")
+            continue
+
+        result = await notebook_lm.ask(query, thread_id=thread_id)
+
+        if thread_id is None:
+            thread_id = result.thread_id
+            print(f"[Thread: {thread_id}]\n")
+
+        print(f"\nAgent: {result.answer}\n")
+
+        if result.summary:
+            print(f"[Summary]\n{result.summary}\n")
 
 
 if __name__ == "__main__":

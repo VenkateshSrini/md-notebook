@@ -28,6 +28,7 @@
 12. [Agent Behaviour & Prompt Design](#12-agent-behaviour--prompt-design)
 13. [Adding New Notes](#13-adding-new-notes)
 14. [Source Notes Format](#14-source-notes-format)
+15. [Multi-turn Conversations \& Memory Design](#15-multi-turn-conversations--memory-design)
 
 ---
 
@@ -38,8 +39,9 @@
 - **Semantic search** — notes are embedded with a sentence-transformer model and stored in a FAISS vector index.
 - **LLM reasoning** — an AI agent (Anthropic Claude or AWS Bedrock) receives the retrieved note snippets as its sole knowledge source and generates grounded, citation-backed answers.
 - **Zero hallucination policy** — the agent is instructed to answer exclusively from retrieved content; if nothing relevant is found it says so explicitly.
+- **Multi-turn conversation** — each conversation session is identified by a `thread_id`. Bounded message history (last 6 raw messages) and a compact rolling summary (≤ 100 lines) are maintained per thread entirely in RAM. The rolling summary is injected as context on every turn so the LLM can answer coherently across turns without ever seeing the full transcript.
 
-The application ships two interfaces:
+The application ships three interfaces:
 
 | Interface | Entry point | Purpose |
 |---|---|---|
@@ -216,11 +218,27 @@ Module-level singletons (`_index`, `_metadata`, `_model`) are loaded on the firs
 | `agent.py` | Defines `_SYSTEM_PROMPT`, `search_notes` tool, agent factory, `ask()`, `startup()` |
 | `__init__.py` | Exports `ask()` and `startup()` |
 
+**`AskResult` (dataclass)**
+
+| Field | Type | Description |
+|---|---|---|
+| `answer` | `str` | LLM-generated, citation-backed answer (summary markers stripped) |
+| `summary` | `str` | Latest cumulative rolling summary (≤ 100 bullet lines) |
+| `thread_id` | `str` | UUID identifying the conversation thread |
+
 **`startup()`**  
 Checks whether the vector-db is populated. If not, triggers `vectorizer.run()`. Must be called before the first `ask()`.
 
-**`ask(query: str) → str`**  
-Lazily builds the `_agent` singleton (Anthropic or Bedrock client, depending on `LLM_PROVIDER`), then calls `await _agent.run(query)` and returns the result as a string.
+**`ask(query: str, thread_id: str | None = None) → AskResult`**  
+Lazily builds the `_agent` singleton, resolves or creates an `AgentSession` for the given `thread_id` (empty/unknown → new session), calls `await _agent.run(query, session=session)`, and returns an `AskResult`. Passing the same `thread_id` on subsequent calls maintains conversation continuity.
+
+**`BoundedHistoryProvider(BaseHistoryProvider)`**  
+Stores the last `max_messages` (default: 6, overridable via `HISTORY_MAX_MESSAGES` env var) raw `Message` objects in `session.state["bounded_history"]["messages"]`. `save_messages()` appends then trims, so RAM usage is hard-capped regardless of conversation length.
+
+**`SummaryContextProvider(BaseContextProvider)`**  
+Before each run: if `session.state["rolling_summary"]["summary"]` is non-empty, injects it as a system instruction block (`[CONVERSATION SUMMARY]…[END SUMMARY]`). After each run: parses the `---SUMMARY---` / `---END SUMMARY---` delimiters from the LLM response and updates the stored summary. Fallback: if the LLM omits the markers, the previous summary is preserved unchanged.
+
+**`_sessions: dict[str, AgentSession]`** — module-level in-memory registry mapping `thread_id → AgentSession`. Cleared on process restart.
 
 **System Prompt Summary:**
 
@@ -267,10 +285,13 @@ LLM_PROVIDER=bedrock    →  Agent(client=BedrockChatClient(), ...)
 
 ```python
 class AskRequest(BaseModel):
-    query: str         # The natural-language question
+    query: str                  # The natural-language question
+    thread_id: str | None = None  # Resume an existing thread; omit to start a new one
 
 class AskResponse(BaseModel):
-    answer: str        # The LLM-generated, citation-backed answer
+    answer: str      # The LLM-generated, citation-backed answer
+    thread_id: str   # The conversation thread UUID (new or existing)
+    summary: str     # Latest cumulative rolling summary (empty on first turn if LLM hasn't responded yet)
 ```
 
 ---
@@ -307,11 +328,13 @@ Builds the full Gradio application and returns it. Called by `main_ui.py`.
 
 Switching is driven by a JS attribute (`data-theme`) on `<body>`. The switch is instant with no server round-trip. The default theme is applied via `INIT_JS` which runs once on page load.
 
-**`_chat(message, history)` (async generator)**  
-1. Appends the user's message to history and yields the updated history immediately.
-2. Inserts an `"Agent is thinking\u2026"` placeholder and yields again.
-3. Calls `await notebook_lm.ask(message)` directly (no HTTP).
-4. Replaces the placeholder with the final answer and yields the completed history.
+**`_chat(message, history, thread_id)` (async generator)**  
+1. Appends the user's message to history and yields immediately.
+2. Inserts an `"Agent is thinking…"` placeholder and yields again.
+3. Calls `await notebook_lm.ask(message, thread_id=thread_id or None)` directly (no HTTP).
+4. Replaces the placeholder with the final answer and yields `(history, "", result.thread_id, result.summary)`.
+
+**Thread state & summary:** A `gr.State("")` component tracks the active `thread_id` across Gradio events. A collapsible `gr.Accordion` below the chatbot contains a read-only `gr.Textbox` that displays the latest rolling summary. Clearing the chat also resets both the thread state and the summary box, starting a fresh conversation.
 
 **`_export_pdf(history)`**  
 Uses `fpdf2.FPDF` to produce an A4, plain-white, black-text PDF:  
@@ -346,6 +369,9 @@ python main.py
 - Prints usage hints.
 - Enters an infinite `input()` loop accepting queries.
 - Prefixing the query with `brief:` triggers the agent's concise response mode.
+- Tracks `thread_id` across turns; prints the thread UUID on the first response.
+- Prints a `[Summary]` block after each response (when non-empty).
+- Type `new` to reset the conversation (new thread, no prior context).
 - Type `quit`, `exit`, or `q` to terminate.
 
 #### `main_api.py` — REST API server
@@ -408,15 +434,20 @@ Ask the NotebookLM agent a question.
 
 ```json
 {
-  "query": "What are the main themes in my notes?"
+  "query": "What are the main themes in my notes?",
+  "thread_id": null
 }
 ```
+
+Omit `thread_id` (or pass `null`) to start a new conversation. Pass the `thread_id` returned from a previous response to continue an existing thread.
 
 **Response body** (`application/json`):
 
 ```json
 {
-  "answer": "Based on your notes, the main themes are ...\n\nSources:\n- example-note.md"
+  "answer": "Based on your notes, the main themes are ...\n\nSources:\n- example-note.md",
+  "thread_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "summary": "• Q: main themes in notes → A: themes are X, Y, Z"
 }
 ```
 
@@ -605,6 +636,7 @@ The LLM agent is governed by `_SYSTEM_PROMPT` in `notebook_lm/agent.py`.
 4. **Citations** — Every answer ends with a `Sources:` section listing the filenames of the retrieved notes.
 5. **Adaptive verbosity** — Keywords like `brief`, `short`, `quick`, `one line` in the query trigger a concise answer. Absence of such keywords, or keywords like `detailed`, `thorough`, `explain`, trigger a comprehensive response.
 6. **Zero hallucination** — The prompt explicitly instructs the model not to fabricate, infer, or extend beyond note content.
+7. **Structured summary output** — Every response must end with a `---SUMMARY---` / `---END SUMMARY---` block containing cumulative `• Q: → A:` bullets (max 100). The prior summary (injected via `[CONVERSATION SUMMARY]` block in the system instructions by `SummaryContextProvider`) must be copied then extended. This embeds summarization into every normal LLM call — zero extra API requests.
 
 **Tool approval mode:** `"never_require"` — the agent executes `search_notes` automatically without pausing for user confirmation.
 
@@ -627,3 +659,132 @@ Notes are plain Markdown (`.md`) files. Any valid Markdown is accepted — headi
 File naming is unrestricted. The filename (including the `.md` extension) is used as the citation reference in agent responses.
 
 Empty files are silently skipped during indexing.
+
+---
+
+## 15. Multi-turn Conversations & Memory Design
+
+### 15.1 Overview
+
+As of the multi-turn update, `md-notebook` supports persistent, thread-based conversations. Each conversation is identified by a `thread_id` (UUID). The same `thread_id` can be passed across CLI turns, API calls, or UI interactions to maintain context.
+
+A conversation is **stateless from the caller's perspective** — the server holds session state in-memory, keyed by `thread_id`. Sending an unknown or empty `thread_id` silently creates a new thread.
+
+> **Note:** Sessions are in-memory only. Restarting the server clears all threads.
+
+---
+
+### 15.2 Memory Design Options Considered
+
+Three approaches were evaluated. All use MAF's `AgentSession` for per-thread state isolation and require **zero extra LLM calls** for memory management.
+
+| Option | What is stored | RAM per session | Context quality | Container safe? |
+|---|---|---|---|---|
+| **A — Summary only** | 100-line rolling summary string | ~8 KB | Good — but no verbatim recent turns | ✅ Yes |
+| **B — Bounded history + Summary** *(chosen)* | Last 6 raw messages + rolling summary | ~50–80 KB | **Best** — verbatim recent context + historical summary | ✅ Yes |
+| **C — InMemoryHistoryProvider + Summary** | All raw messages (unbounded) + summary | Unbounded | Best but wasteful | ⚠️ Risk |
+
+**Why Option C was rejected:**  
+`InMemoryHistoryProvider.save_messages()` is an unbounded append (`state["messages"] = [*existing, *messages]`) with no `max_messages` parameter. Over a long conversation this grows indefinitely — a risk in containerised deployments.
+
+**Why not `SlidingWindowStrategy`?**  
+Inspection of the MAF source confirms it only marks old messages `_excluded=True` in annotations; it does **not** remove them from `state["messages"]`. No actual RAM saving.
+
+**Why not `SummarizationStrategy`?**  
+Inspection of the MAF source confirms it calls `await self.client.get_response(...)` — a separate LLM API call for every summarization trigger. Explicitly excluded by requirement.
+
+**Why Option B was chosen:**  
+- Hard RAM cap: `save_messages()` trims on every write — `combined[-max_messages:]`.
+- Highest context quality: the LLM sees verbatim recent turns (exact phrasing + citations) **plus** a compressed summary of all older turns.
+- Zero extra LLM calls: the rolling summary is embedded inside every normal response via System Prompt Rule 7.
+- Container-safe: worst-case ~80 KB per session × 20 concurrent users = ~1.6 MB.
+
+---
+
+### 15.3 MAF Components Used
+
+| Component | Role |
+|---|---|
+| `AgentSession` | Per-thread state container (`session_id` + mutable `state` dict) |
+| `BaseHistoryProvider` | Abstract base for `BoundedHistoryProvider`; framework calls `before_run`/`after_run` automatically |
+| `BaseContextProvider` | Abstract base for `SummaryContextProvider`; injected into agent's context pipeline |
+| `context_providers=[...]` | Suppresses the framework's default `InMemoryHistoryProvider`; our two providers replace it |
+
+**Provider-scoped state mapping:**
+
+| Provider | `source_id` | State key | Content |
+|---|---|---|---|
+| `BoundedHistoryProvider` | `bounded_history` | `session.state["bounded_history"]["messages"]` | `list[Message]` — last 6 raw messages |
+| `SummaryContextProvider` | `rolling_summary` | `session.state["rolling_summary"]["summary"]` | `str` — latest cumulative summary |
+
+---
+
+### 15.4 Execution Flow per Turn
+
+```
+ask(query, thread_id?)
+  │
+  ├─ empty/unknown thread_id → AgentSession()  (new session_id = new thread_id)
+  └─ known thread_id         → _sessions[thread_id]
+          │
+          ▼
+  agent.run(query, session=session)
+          │
+          ├─ BoundedHistoryProvider.before_run()
+          │     reads state["bounded_history"]["messages"]  (last 6 msgs)
+          │     → context.extend_messages(...)              (verbatim recent turns)
+          │
+          ├─ SummaryContextProvider.before_run()
+          │     reads state["rolling_summary"]["summary"]
+          │     → context.extend_instructions(...)          (compact history)
+          │
+          ▼
+  LLM call (single):
+    [summary instructions] + [last 6 messages] + [user query]
+    → tool call: search_notes(query)
+    → tool result: top-5 note snippets
+    → final answer + ---SUMMARY--- block
+          │
+          ├─ BoundedHistoryProvider.after_run()
+          │     appends new messages; trims to last max_messages
+          │
+          ├─ SummaryContextProvider.after_run()
+          │     parses ---SUMMARY--- / ---END SUMMARY--- from response
+          │     → saves new summary to state["rolling_summary"]["summary"]
+          │
+          ▼
+  _parse_response(result.text) → (answer, _)
+  summary = session.state["rolling_summary"].get("summary", "")
+  return AskResult(answer, summary, thread_id)
+```
+
+---
+
+### 15.5 Summary Format (System Prompt Rule 7)
+
+The LLM is instructed to always append the following block at the end of every response:
+
+```
+---SUMMARY---
+• Q: <one-line question summary> → A: <one-line answer summary>
+(prior bullets copied from [CONVERSATION SUMMARY] if provided, new bullet appended last)
+---END SUMMARY---
+```
+
+Rules enforced by the prompt:
+- Each bullet on a single line.
+- Total bullets ≤ 100.
+- Maximally compact — no filler words.
+- No source citations inside the block.
+
+If the LLM omits the markers (e.g., on a refusal), `_parse_response()` returns `(full_text, "")` and the previously stored summary is preserved unchanged.
+
+---
+
+### 15.6 RAM Estimates
+
+| Component | Per session | 20 sessions |
+|---|---|---|
+| `BoundedHistoryProvider` (6 msgs × ~10 KB avg) | ~60 KB | ~1.2 MB |
+| `SummaryContextProvider` (100-line max) | ~8 KB | ~160 KB |
+| **Total (worst case)** | **~68 KB** | **~1.4 MB** |
